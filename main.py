@@ -1,0 +1,144 @@
+# basic and separable --- main_basic_and_separable
+
+import random
+
+import torch
+import utils
+from option import opt
+from trainer import Trainer
+import model.common as common
+
+from importlib import import_module
+import model
+import numpy as np
+import torch.nn as nn
+import time
+import csv
+import copy
+import os
+import visdom
+
+import math
+import cv2
+import PIL
+import scipy.io as sio
+from io import BytesIO
+import matplotlib.pyplot as plt
+from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
+
+
+if __name__ == "__main__":
+    currentTime = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+
+    try:
+        os.makedirs('../experiment/' + opt.save)
+    except FileExistsError:
+        pass
+    finally:
+        # create csv log 
+        logDict = ['QF', 'bpp', 'ori_psnr', 'out_psnr', 'out_ssim']
+        with open(('../experiment/' + opt.save + '/' + 'encodedLog_Q{modelQF}_{}.csv').format(currentTime, modelQF = opt.modelQF), 'w', newline='') as csvFile:
+            writer = csv.DictWriter(csvFile, logDict)
+            writer.writeheader()
+
+    bppDict = ['filename', 'bit','bpp','psnr','ssim','og-bit','og-bpp','og-psnr','og-ssim']
+    with open('../experiment/' + opt.save + '/' + 'every_bpp_ch{}_patch{}.csv'.format(opt.ch,opt.patchSize), 'w', newline='') as csvfile:
+        writer2 = csv.writer(csvfile)
+        writer2.writerow(bppDict)
+    # set seed
+    utils.seed_torch()
+
+    # image list
+    imageList = os.listdir(opt.data_path)
+    imageList.sort()
+    number_of_Image = len(imageList)
+
+    for imageQF in opt.imageQFs:
+        singleQF_performanceLog = {'bpp':0, 'ori_psnr':0, 'out_psnr':0, 'out_ssim':0}
+        for idx_img in range(number_of_Image):
+            # load image
+            img = cv2.imread(opt.data_path + imageList[idx_img])[:,:,-1]
+
+            # create tensor (all_target, all_input, all_output)
+            all_target = torch.Tensor(img.astype(float)).view(1,1,img.shape[0],img.shape[1])
+            # produce encoded image
+            img_decoded, encodedImageBitLength = utils.compressImage(img, imageQF, opt.codec)
+            all_input = torch.tensor(img_decoded,dtype=torch.float32).view(all_target.shape)
+            all_output = all_input.clone()
+
+            # create patch pair list
+            patchPairList, hPatchNum, wPatchNum = utils.create_patchPairList(all_input, all_target)
+
+            total_encodedWeightBits = 0            
+            for patchNum in range(hPatchNum*wPatchNum):
+            
+                # get current patch pair
+                cPatchPair = patchPairList[patchNum]
+
+                checkpoint = utils.checkpoint(opt)
+                if checkpoint.ok:
+                    t = Trainer(checkpoint, opt)
+                    t.inputData, t.target = t._prepare(cPatchPair[0], cPatchPair[1])
+
+                    ''' run train '''
+                    while not t.terminate():
+                        t.train()
+                        t.test()
+
+                    ''' quantize weight '''
+                    t.quantize_weight()
+
+                    ''' encode_quanWeight '''
+                    encodedWeightBits = checkpoint.encode_quanWeight(t)
+                    total_encodedWeightBits += len(encodedWeightBits)
+
+                    ''' encode_quanWeight '''
+                    r, c = patchNum//wPatchNum, patchNum%wPatchNum
+                    patchHeight = math.ceil(all_input.shape[2]/hPatchNum)
+                    patchWeight = math.ceil(all_input.shape[3]/wPatchNum)
+                    # current patch size
+                    cPatchHeight, cPatchWeight = all_output[0,0,r*patchHeight:(r+1)*patchHeight,c*patchWeight:(c+1)*patchWeight].shape
+                    all_output[:,:,r*patchHeight:(r+1)*patchHeight,c*patchWeight:(c+1)*patchWeight] = t.output[:,:,-cPatchHeight:,-cPatchWeight:]
+
+                    checkpoint.done()
+
+
+            singleQF_performanceLog['bpp'] += (total_encodedWeightBits + encodedImageBitLength) / all_input.numel()
+            singleQF_performanceLog['ori_psnr'] += utils.calc_PSNR(all_input, all_target, 0) 
+            singleQF_performanceLog['out_psnr'] += utils.calc_PSNR(all_output, all_target, 0)
+            singleQF_performanceLog['out_ssim'] += float(ssim(all_output.cuda(), all_target.cuda()))
+
+            file_bit = total_encodedWeightBits + encodedImageBitLength
+            file_bpp = file_bit/all_input.numel()
+            file_psnr = utils.calc_PSNR(all_output, all_target, 0)
+            file_ssim = float(ssim(all_output.cuda(), all_target.cuda()))
+            og_bit = encodedImageBitLength
+            og_bpp = encodedImageBitLength/all_input.numel()
+            og_psnr = utils.calc_PSNR(all_input, all_target, 0)
+            og_ssim = float(ssim(all_input.cuda(), all_target.cuda()))
+
+            ''' save results '''
+            if opt.save_results:
+                filename = '{}/results/ours_{}_QF{}_{}'.format(t.ckp.dir, opt.codec, imageQF, imageList[idx_img])
+                tmp = all_output.data[0].cpu()
+                tmp = tmp.clamp(0,255).add(0.5).numpy().transpose(1,2,0).astype('uint8')[:, :, ::-1]
+                cv2.imwrite('{}.png'.format(filename), tmp)
+            
+            with open('../experiment/' + opt.save + '/' + 'every_bpp_ch{}_patch{}.csv'.format(opt.ch,opt.patchSize), 'a', newline='') as csvfile:
+                writer2 = csv.writer(csvfile)
+                file_name = 'ours_{}_QF{}_{}'.format(opt.codec, imageQF, imageList[idx_img])
+                writer2.writerow([file_name, file_bit, '{:.4f}'.format(file_bpp),'{:.3f}'.format(file_psnr),'{:.5}'.format(file_ssim)
+                                            ,og_bit,'{:.4f}'.format(og_bpp),'{:.3f}'.format(og_psnr),'{:.5}'.format(og_ssim)])
+
+        for key in singleQF_performanceLog:
+            singleQF_performanceLog[key] /= number_of_Image
+
+        with open(('../experiment/' + opt.save + '/' + 'encodedLog_Q{modelQF}_{}.csv').format(currentTime, modelQF = opt.modelQF), 'a', newline='') as csvFile:
+            writer = csv.DictWriter(csvFile, logDict)
+            singleQF_performanceLog['QF'] = imageQF
+            writer.writerow(singleQF_performanceLog) 
+
+        endtime = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        print('The endding time : ',endtime)
+
+
